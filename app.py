@@ -21,7 +21,7 @@ from langchain_core.prompts import PromptTemplate
 # ==========================================
 
 load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = os.secrets("GROQ_API_KEY")
 # ==========================================
 # STREAMLIT CONFIG
 # ==========================================
