@@ -19,3 +19,4 @@ sentence-transformers
 python-dotenv
 openai
 langchain_groq
+protobuf==3.20.3
