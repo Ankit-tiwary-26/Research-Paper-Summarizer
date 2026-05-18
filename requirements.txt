@@ -18,3 +18,4 @@ tiktoken
 sentence-transformers
 python-dotenv
 openai
+langchain_groq
