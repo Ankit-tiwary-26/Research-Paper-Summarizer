@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import uuid
 import tempfile
 import streamlit as st
 
@@ -21,7 +22,8 @@ from langchain_core.prompts import PromptTemplate
 # ==========================================
 
 load_dotenv()
-GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
 # ==========================================
 # STREAMLIT CONFIG
 # ==========================================
@@ -85,6 +87,11 @@ st.markdown("""
 # SESSION STATE INITIALIZATION
 # ==========================================
 
+# FIX 1: Give every browser session a unique ID so ChromaDB
+# collections never collide between users or uploads.
+if "session_id" not in st.session_state:
+    st.session_state.session_id = uuid.uuid4().hex[:12]
+
 defaults = {
     "qa_chain": None,
     "chat_history": [],
@@ -94,7 +101,8 @@ defaults = {
     "documents": None,             # Raw loaded pages
     "keywords": [],
     "pdf_name": "",
-    "processing_done": False,
+    "pdf_size": 0,                 # FIX 2: track file size to catch
+    "processing_done": False,      #   same-name-different-content uploads
 }
 
 for key, value in defaults.items():
@@ -111,7 +119,7 @@ with st.sidebar:
     st.subheader(" Model")
     model_choice = st.selectbox(
         "Model",
-        options=["llama-3.1-8b-instant","llama-3.3-70b-versatile"],
+        options=["llama-3.1-8b-instant", "llama-3.3-70b-versatile"],
         help="Flash is faster; Pro is more detailed"
     )
 
@@ -144,6 +152,9 @@ with st.sidebar:
     st.divider()
 
     if st.button(" Reset Session", use_container_width=True):
+        # FIX 3: full reset including session_id so a fresh
+        # ChromaDB collection is created on next upload.
+        st.session_state.session_id = uuid.uuid4().hex[:12]
         for key in defaults:
             st.session_state[key] = defaults[key]
         st.rerun()
@@ -174,22 +185,37 @@ def load_embeddings():
     )
 
 
-def extract_metadata(documents, qa_chain):
-    """Use LLM to extract paper metadata."""
-    response = qa_chain.invoke({
-        "question": (
-            "Extract the following from the paper and respond ONLY in valid JSON "
-            "with these exact keys: title, authors, year, journal, abstract_summary "
-            "(2 sentences max), domain. If unknown, use null."
-        )
-    })
-    raw = response["answer"]
+# FIX 4: Extract metadata directly from raw document text (first 3 pages)
+# instead of going through the retrieval chain. The retrieval chain uses
+# semantic similarity, which often misses the title/author block because
+# those lines are short and don't match query embeddings well.
+def extract_metadata(documents, llm):
+    """Use LLM directly on first-page text to extract paper metadata."""
+    # Use up to first 3 pages where title/author/abstract usually live
+    first_pages_text = "\n\n".join(
+        doc.page_content for doc in documents[:3]
+    )[:4000]  # cap at ~4 k chars to stay within context
+
+    prompt = (
+        "Below is the beginning of a research paper. "
+        "Extract the following fields and respond ONLY in valid JSON "
+        "with these exact keys: title, authors, year, journal, "
+        "abstract_summary (2 sentences max), domain. "
+        "If a field cannot be found, use null.\n\n"
+        f"Paper text:\n{first_pages_text}\n\nJSON:"
+    )
+
+    raw = llm.invoke(prompt).content
     # Strip markdown code fences if present
     raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("```").strip()
     try:
         return json.loads(raw)
     except Exception:
-        return {}
+        # Fallback: try to at least grab the title from the first line
+        first_line = documents[0].page_content.strip().splitlines()[0] if documents else ""
+        return {"title": first_line or None, "authors": None,
+                "year": None, "journal": None,
+                "abstract_summary": None, "domain": None}
 
 
 def extract_keywords(qa_chain):
@@ -204,13 +230,18 @@ def extract_keywords(qa_chain):
     return [kw.strip() for kw in raw.split(",") if kw.strip()][:10]
 
 
-def build_qa_chain(chunks, model_name, temp, top_k):
+def build_qa_chain(chunks, model_name, temp, top_k, session_id):
     """Build and return the ConversationalRetrievalChain."""
     embeddings = load_embeddings()
 
+    # FIX 5: Use a per-session collection name so each user/upload
+    # gets its own isolated ChromaDB collection. Without this, all
+    # sessions share the default "langchain" collection and users
+    # see each other's PDFs.
     vectorstore = Chroma.from_documents(
         documents=chunks,
-        embedding=embeddings
+        embedding=embeddings,
+        collection_name=f"rpa_{session_id}",   # unique per session
     )
 
     llm = ChatGroq(
@@ -219,7 +250,6 @@ def build_qa_chain(chunks, model_name, temp, top_k):
         temperature=temp
     )
 
-    # Custom prompt to keep answers grounded in the paper
     condense_prompt = PromptTemplate.from_template(
         "Given the conversation history and the new question, "
         "rephrase it as a standalone question.\n\n"
@@ -282,32 +312,42 @@ uploaded_file = st.file_uploader(
     type="pdf",
     help="Maximum recommended size: 50MB"
 )
-if "current_file" not in st.session_state:
-    st.session_state.current_file = None
 
-if uploaded_file is not None:
-
-    # Detect new PDF
-    if st.session_state.current_file != uploaded_file.name:
-
-        st.session_state.current_file = uploaded_file.name
-
-        # Reset old memory
-        st.session_state.chat_history = []
-        st.session_state.qa_chain = None
-        st.session_state.vectorstore = None
-
-        st.success("New PDF uploaded. Previous memory cleared.")
 # ==========================================
 # PROCESS PDF
 # ==========================================
 
-if uploaded_file and (not st.session_state.processing_done or
-                      uploaded_file.name != st.session_state.pdf_name):
+# FIX 6: Detect a new upload by BOTH filename AND file size.
+# Previously, if two different papers had the same filename (e.g. both
+# called "paper.pdf") the second upload was silently ignored.
+def _is_new_upload(f):
+    if f is None:
+        return False
+    if not st.session_state.processing_done:
+        return True
+    return (
+        f.name != st.session_state.pdf_name
+        or f.size != st.session_state.pdf_size
+    )
 
-    st.session_state.pdf_name = uploaded_file.name
-    st.session_state.summary_cache = {}   # clear cache for new file
-    st.session_state.chat_history = []
+if _is_new_upload(uploaded_file):
+
+    # FIX 7: Rotate the session_id so the new upload gets a fresh
+    # ChromaDB collection, not the old one.
+    st.session_state.session_id = uuid.uuid4().hex[:12]
+
+    # FIX 8: Reset ALL relevant state fields before processing.
+    # Previously raw_chat_history and qa_chain were left over, which
+    # caused old conversation memory to bleed into the new paper.
+    st.session_state.pdf_name         = uploaded_file.name
+    st.session_state.pdf_size         = uploaded_file.size
+    st.session_state.summary_cache    = {}
+    st.session_state.chat_history     = []
+    st.session_state.raw_chat_history = []
+    st.session_state.qa_chain         = None
+    st.session_state.paper_metadata   = {}
+    st.session_state.keywords         = []
+    st.session_state.processing_done  = False
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(uploaded_file.read())
@@ -323,7 +363,7 @@ if uploaded_file and (not st.session_state.processing_done or
         st.session_state.documents = documents
 
         # Step 2: Split
-        progress.progress(30, text=" Splitting into chunks...")
+        progress.progress(30, text="Splitting into chunks...")
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
@@ -333,26 +373,36 @@ if uploaded_file and (not st.session_state.processing_done or
 
         # Step 3: Build chain
         progress.progress(60, text="Building vector store & LLM chain...")
-        qa_chain = build_qa_chain(chunks, model_choice, temperature, top_k)
+        qa_chain = build_qa_chain(
+            chunks, model_choice, temperature, top_k,
+            st.session_state.session_id          # pass unique ID
+        )
         st.session_state.qa_chain = qa_chain
 
-        # Step 4: Metadata
-        progress.progress(80, text="🔍 Extracting metadata & keywords...")
-        st.session_state.paper_metadata = extract_metadata(documents, qa_chain)
-        st.session_state.keywords = extract_keywords(qa_chain)
+        # Step 4: Build a plain LLM for direct metadata extraction
+        progress.progress(80, text="Extracting metadata & keywords...")
+        plain_llm = ChatGroq(
+            model=model_choice,
+            groq_api_key=GROQ_API_KEY,
+            temperature=0                        # deterministic for JSON
+        )
+        st.session_state.paper_metadata = extract_metadata(documents, plain_llm)
+        st.session_state.keywords       = extract_keywords(qa_chain)
 
-        progress.progress(100, text=" Done!")
+        progress.progress(100, text="Done!")
         st.session_state.processing_done = True
 
     except Exception as e:
-        st.error(f" Error processing PDF: {e}")
+        st.error(f"Error processing PDF: {e}")
         st.stop()
     finally:
         os.unlink(pdf_path)
         progress.empty()
 
-    st.success(f"✅ **{uploaded_file.name}** processed — "
-               f"{len(documents)} pages, {len(chunks)} chunks")
+    st.success(
+        f"✅ **{uploaded_file.name}** processed — "
+        f"{len(documents)} pages, {len(chunks)} chunks"
+    )
 
 # ==========================================
 # MAIN CONTENT (only after processing)
@@ -375,7 +425,6 @@ if st.session_state.processing_done:
             if meta.get("abstract_summary"):
                 st.info(f" **Abstract:** {meta['abstract_summary']}")
         st.divider()
-
 
     # ---- STATS ----
     docs = st.session_state.documents
@@ -429,7 +478,6 @@ if st.session_state.processing_done:
 
         st.divider()
 
-        # Download summaries
         if st.session_state.summary_cache:
             combined = "\n\n---\n\n".join(
                 f"### {k.upper()}\n{v}"
@@ -481,7 +529,6 @@ if st.session_state.processing_done:
 
         st.divider()
 
-        # Critical review
         if st.button("Generate Critical Review", use_container_width=True):
             result = get_summary("critical",
                 "Provide a balanced critical review of this paper: "
@@ -493,7 +540,6 @@ if st.session_state.processing_done:
     with tab3:
         st.subheader("Chat with the Paper")
 
-        # Suggested questions
         st.markdown("** Suggested Questions:**")
         suggestions = [
             "What problem does this paper solve?",
@@ -509,11 +555,8 @@ if st.session_state.processing_done:
 
         st.divider()
 
-        # Chat input
         prefill = st.session_state.pop("prefill_question", "")
         user_question = st.chat_input("Ask anything about the paper...")
-
-        # Use prefill if button was clicked
         active_question = user_question or prefill
 
         if active_question:
@@ -532,13 +575,11 @@ if st.session_state.processing_done:
                 except Exception as e:
                     st.error(f" Error: {e}")
 
-        # Render chat history
         if st.session_state.chat_history:
             for sender, message in st.session_state.chat_history:
                 with st.chat_message("user" if sender == "You" else "assistant"):
                     st.markdown(message)
 
-            # Sources for last response
             last_sources = st.session_state.get("last_sources", [])
             if last_sources:
                 with st.expander(f" Source References ({len(last_sources)} chunks)"):
@@ -552,11 +593,10 @@ if st.session_state.processing_done:
                             unsafe_allow_html=True
                         )
 
-            # Export chat
             st.divider()
             col_a, col_b = st.columns([3, 1])
             col_a.download_button(
-                "⬇Download Chat History",
+                "⬇ Download Chat History",
                 data=export_chat_history(),
                 file_name=f"{st.session_state.pdf_name}_chat.txt",
                 mime="text/plain",
@@ -568,7 +608,6 @@ if st.session_state.processing_done:
                 st.rerun()
 
 else:
-    # ---- PLACEHOLDER ----
     st.info(
         " Upload a PDF above to get started. "
         "You can then generate summaries, explore insights, "
