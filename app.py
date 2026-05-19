@@ -139,8 +139,8 @@ with st.sidebar:
     st.subheader(" Retrieval")
     top_k = st.slider(
         "Top-K Chunks",
-        1, 8, 4,
-        help="How many chunks to retrieve per query"
+        1, 10, 6,
+        help="How many chunks to retrieve per query. Higher = more context, slower."
     )
 
     st.divider()
@@ -259,12 +259,20 @@ def build_qa_chain(chunks, model_name, temp, top_k, session_id):
     qa_prompt = PromptTemplate(
         input_variables=["context", "question"],
         template=(
-            "You are an expert research paper analyst. "
-            "Use ONLY the provided context from the paper to answer. "
-            "If the answer is not in the context, say so clearly.\n\n"
-            "Context:\n{context}\n\n"
+            "You are an expert research paper analyst helping a reader deeply "
+            "understand a paper. You are given retrieved context chunks from the paper.\n\n"
+            "Rules:\n"
+            "- Answer as completely as possible using the context provided.\n"
+            "- Synthesize across all chunks — do NOT just quote one chunk.\n"
+            "- If numerical results, tables, or metrics appear in the context, include them.\n"
+            "- If certain details are genuinely absent from the context, briefly note it "
+            "BUT still give the best possible answer from what IS available. "
+            "Never respond with only 'the context does not contain this'.\n"
+            "- Use bullet points or numbered lists for multi-part answers.\n"
+            "- Cite page numbers when available (e.g. [Page 5]).\n\n"
+            "Context chunks:\n{context}\n\n"
             "Question: {question}\n\n"
-            "Answer (be precise and cite page numbers if possible):"
+            "Detailed answer:"
         )
     )
 
@@ -274,9 +282,16 @@ def build_qa_chain(chunks, model_name, temp, top_k, session_id):
         output_key="answer"
     )
 
+    # MMR (Maximal Marginal Relevance) returns diverse chunks instead of
+    # the top-k most similar ones that often repeat the same passage.
+    retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": top_k, "fetch_k": top_k * 3, "lambda_mult": 0.6},
+    )
+
     return ConversationalRetrievalChain.from_llm(
         llm=llm,
-        retriever=vectorstore.as_retriever(search_kwargs={"k": top_k}),
+        retriever=retriever,
         memory=memory,
         return_source_documents=True,
         condense_question_prompt=condense_prompt,
@@ -586,12 +601,7 @@ if st.session_state.processing_done:
                     for i, doc in enumerate(last_sources):
                         page = doc.metadata.get("page", "?")
                         st.markdown(f"**Chunk {i+1} — Page {page}**")
-                        st.markdown(
-                            f'<div style="background:#f5f5f5;padding:10px;'
-                            f'border-radius:6px;font-size:0.85rem">'
-                            f'{doc.page_content[:400]}...</div>',
-                            unsafe_allow_html=True
-                        )
+                        st.code(doc.page_content[:400] + "...", language=None)
 
             st.divider()
             col_a, col_b = st.columns([3, 1])
