@@ -282,7 +282,22 @@ uploaded_file = st.file_uploader(
     type="pdf",
     help="Maximum recommended size: 50MB"
 )
+if "current_file" not in st.session_state:
+    st.session_state.current_file = None
 
+if uploaded_file is not None:
+
+    # Detect new PDF
+    if st.session_state.current_file != uploaded_file.name:
+
+        st.session_state.current_file = uploaded_file.name
+
+        # Reset old memory
+        st.session_state.chat_history = []
+        st.session_state.qa_chain = None
+        st.session_state.vectorstore = None
+
+        st.success("New PDF uploaded. Previous memory cleared.")
 # ==========================================
 # PROCESS PDF
 # ==========================================
